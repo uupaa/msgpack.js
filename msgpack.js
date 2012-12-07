@@ -60,13 +60,19 @@ function msgpackpack(data,       // @param Mix:
 
 // msgpack.unpack
 function msgpackunpack(data) { // @param BinaryString/ByteArray:
-                               // @return Mix/undefined:
+                               // @return Mix/undefined/null:
                                //       undefined is error return
+                               //       null means buffer exhausted
     //  [1][String to mix]    msgpack.unpack("...") -> {}
     //  [2][ByteArray to mix] msgpack.unpack([...]) -> {}
 
-    _buf = typeof data === "string" ? toByteArray(data) : data;
-    _idx = -1;
+	if (data != null) {
+        _buf = typeof data === "string" ? toByteArray(data) : data;
+        _idx = -1;
+    }
+    else if (_buf.length <= _idx) {
+        return null;
+    }
     return decode(); // mix or undefined
 }
 
