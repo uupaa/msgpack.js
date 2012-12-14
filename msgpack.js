@@ -13,6 +13,7 @@ globalScope.msgpack = {
     unpack:     msgpackunpack,  // msgpack.unpack(data:BinaryString/ByteArray):Mix
                                 //  [1][String to mix]    msgpack.unpack("...") -> {}
                                 //  [2][ByteArray to mix] msgpack.unpack([...]) -> {}
+    stream_unpacker: msgpack_stream_unpacker_new,
     worker:     "msgpack.js",   // msgpack.worker - WebWorkers script filename
     upload:     msgpackupload,  // msgpack.upload(url:String, option:Hash, callback:Function)
     download:   msgpackdownload // msgpack.download(url:String, option:Hash, callback:Function)
@@ -68,6 +69,11 @@ function msgpackunpack(data) { // @param BinaryString/ByteArray:
     _buf = typeof data === "string" ? toByteArray(data) : data;
     _idx = -1;
     return decode(); // mix or undefined
+}
+
+// msgpack.stream_unpacker
+function msgpack_stream_unpacker_new() {
+    return new stream_decoder();
 }
 
 // inner - encoder
@@ -247,7 +253,7 @@ function decode() { // @return Mix:
     var size, i, iz, c, num = 0,
         sign, exp, frac, ary, hash,
         buf = _buf, type = buf[++_idx];
-
+        
     if (type >= 0xe0) {             // Negative FixNum (111x xxxx) (-32 ~ -1)
         return type - 0x100;
     }
@@ -383,6 +389,255 @@ function decode() { // @return Mix:
     }
     return;
 }
+
+// stream decoder
+var stream_decoder = (function () {
+    function _stream_decoder() {
+        var that = this;
+        that._buf        = []; // decode buffer
+        that._idx        = 0;  // decode buffer[index]
+        that._stack      = [];
+        that._type       = null;    //current decoded type
+    }
+    var constant = {
+        ARRAY_VALUE: 1,
+        MAP_VALUE: 2,
+        MAP_KEY: 3,
+    }
+    function stream_decode(that) { // @return Mix:
+        while (that._buf.length > that._idx) {
+            var rv = stream_decode_token(that);
+            if (rv === undefined) { 
+                return; /* not enough buffer length */
+            }
+            else {
+                that._type = null;  //reset type
+                var stack = that._stack;
+                ReduceStack: while (true) {
+                    if (stack.length > 0) {
+                        var top = stack[stack.length - 1];
+                        switch(top.type) {
+                        case constant.ARRAY_VALUE:
+                            top.value.push(rv); 
+                            if (top.value.length == top.reqlen) {
+                                rv = top.value;
+                                stack.pop();
+                                break;
+                            }
+                            break ReduceStack; //try next stream_decode_token
+                        case constant.MAP_KEY:
+                            top.key = rv;
+                            top.type = constant.MAP_VALUE;
+                            break ReduceStack; //try next stream_decode_token
+                        case constant.MAP_VALUE:
+                            top.value[top.key] = rv;
+                            if (Object.keys(top.value).length == top.reqlen) {
+                                rv = top.value;
+                                stack.pop();
+                                break;
+                            }
+                            top.type = constant.MAP_KEY;
+                            break ReduceStack; //try next stream_decode_token
+                        default:
+                            throw "invalid stack type:" + top.type;
+                        }
+                    }
+                    else {
+                        return rv;
+                    }
+                }
+            }
+        }
+        return;/* not enough buffer length */
+    }
+    
+    function push_stack(that, type, reqlen, value) {
+        that._stack.push({
+            type: type,
+            reqlen: reqlen,
+            value: value,
+        });
+        that._type = null;  //when push stack, reset parsed type to parse element of array or hash
+    }
+    function stream_decode_token(that) {
+        var size, i, iz, c, num = 0,
+            sign, exp, frac, ary, hash,
+            buf = that._buf;
+        if (that._type === null) {  //type check is only done when current parsed type not decided
+            if (buf.length <= (that._idx + 1)) { return; }
+            type = buf[++that._idx];
+            if (type >= 0xe0) {             // Negative FixNum (111x xxxx) (-32 ~ -1)
+                return type - 0x100;
+            }
+            if (type < 0xc0) {
+                if (type < 0x80) {          // Positive FixNum (0xxx xxxx) (0 ~ 127)
+                    return type;
+                }
+                if (type < 0x90) {          // FixMap (1000 xxxx)
+                    num  = type - 0x80;
+                    that._type = 0x80;
+                } else if (type < 0xa0) {   // FixArray (1001 xxxx)
+                    num  = type - 0x90;
+                    that._type = 0x90;
+                } else { //if (type < 0xc0)   // FixRaw (101x xxxx)
+                    that._fixrawlen  = type - 0xa0;
+                    that._type = 0xa0;
+                } 
+            }
+            else {
+                that._type = type;
+            }
+        }
+        switch (that._type) {
+        case 0xc0:  return null;
+        case 0xc2:  return false;
+        case 0xc3:  return true;
+        case 0xca:  // float
+                    if (buf.length <= (that._idx + 4)) { return; }
+                    num = buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16) +
+                                                    (buf[++that._idx] <<  8) + buf[++that._idx];
+                    sign =  num & 0x80000000;    //  1bit
+                    exp  = (num >> 23) & 0xff;   //  8bits
+                    frac =  num & 0x7fffff;      // 23bits
+                    if (!num || num === 0x80000000) { // 0.0 or -0.0
+                        return 0;
+                    }
+                    if (exp === 0xff) { // NaN or Infinity
+                        return frac ? NaN : Infinity;
+                    }
+                    return (sign ? -1 : 1) *
+                                (frac | 0x800000) * Math.pow(2, exp - 127 - 23); // 127: bias
+        case 0xcb:  // double
+                    if (buf.length <= (that._idx + 8)) { return; }
+                    num = buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16) +
+                                                    (buf[++that._idx] <<  8) + buf[++that._idx];
+                    sign =  num & 0x80000000;    //  1bit
+                    exp  = (num >> 20) & 0x7ff;  // 11bits
+                    frac =  num & 0xfffff;       // 52bits - 32bits (high word)
+                    if (!num || num === 0x80000000) { // 0.0 or -0.0
+                        that._idx += 4;
+                        return 0;
+                    }
+                    if (exp === 0x7ff) { // NaN or Infinity
+                        that._idx += 4;
+                        return frac ? NaN : Infinity;
+                    }
+                    num = buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16) +
+                                                    (buf[++that._idx] <<  8) + buf[++that._idx];
+                    return (sign ? -1 : 1) *
+                                ((frac | 0x100000) * Math.pow(2, exp - 1023 - 20) // 1023: bias
+                                 + num * Math.pow(2, exp - 1023 - 52));
+        // 0xcf: uint64, 0xce: uint32, 0xcd: uint16
+        case 0xcf:  if (buf.length < (that._idx + 8)) { return; }
+                    num =  buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16) +
+                                                     (buf[++that._idx] <<  8) + buf[++that._idx];
+                    return num * 0x100000000 +
+                           buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16) +
+                                                     (buf[++that._idx] <<  8) + buf[++that._idx];
+        case 0xce:  if (buf.length <= (that._idx + 4)) { return; }
+                    num += buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16);
+        case 0xcd:  if (buf.length <= (that._idx + 2)) { return; }
+                    num += buf[++that._idx] << 8;
+        case 0xcc:  if (buf.length <= (that._idx + 1)) { return; }
+                    return num + buf[++that._idx];
+        // 0xd3: int64, 0xd2: int32, 0xd1: int16, 0xd0: int8
+        case 0xd3:  if (buf.length <= (that._idx + 8)) { return; }
+                    num = buf[++that._idx];
+                    if (num & 0x80) { // sign -> avoid overflow
+                        return ((num         ^ 0xff) * 0x100000000000000 +
+                                (buf[++that._idx] ^ 0xff) *   0x1000000000000 +
+                                (buf[++that._idx] ^ 0xff) *     0x10000000000 +
+                                (buf[++that._idx] ^ 0xff) *       0x100000000 +
+                                (buf[++that._idx] ^ 0xff) *         0x1000000 +
+                                (buf[++that._idx] ^ 0xff) *           0x10000 +
+                                (buf[++that._idx] ^ 0xff) *             0x100 +
+                                (buf[++that._idx] ^ 0xff) + 1) * -1;
+                    }
+                    return num         * 0x100000000000000 +
+                           buf[++that._idx] *   0x1000000000000 +
+                           buf[++that._idx] *     0x10000000000 +
+                           buf[++that._idx] *       0x100000000 +
+                           buf[++that._idx] *         0x1000000 +
+                           buf[++that._idx] *           0x10000 +
+                           buf[++that._idx] *             0x100 +
+                           buf[++that._idx];
+        case 0xd2:  if (buf.length <= (that._idx + 4)) { return; }
+                    num  =  buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16) +
+                           (buf[++that._idx] << 8) + buf[++that._idx];
+                    return num < 0x80000000 ? num : num - 0x100000000; // 0x80000000 * 2
+        case 0xd1:  if (buf.length <= (that._idx + 2)) { return; }
+                    num  = (buf[++that._idx] << 8) + buf[++that._idx];
+                    return num < 0x8000 ? num : num - 0x10000; // 0x8000 * 2
+        case 0xd0:  if (buf.length <= (that._idx + 1)) { return; }
+                    num  =  buf[++that._idx];
+                    return num < 0x80 ? num : num - 0x100; // 0x80 * 2
+        // 0xdb: raw32, 0xda: raw16, 0xa0: raw ( string )
+        case 0xdb:  i = that._idx;
+                    if (buf.length <= (i + 4)) { return; }
+                    num +=  buf[++i] * 0x1000000 + (buf[++i] << 16);
+        case 0xda:  if (i === undefined) { i = that._idx; }
+                    if (buf.length <= (i + 2)) { return; }
+                    num += (buf[++i] << 8)       +  buf[++i];
+        case 0xa0:  // utf8.decode
+                    if (i === undefined) { 
+                        i = that._idx; 
+                        num = that._fixrawlen;
+                    }
+                    if (buf.length <= (i + num)) { return; }
+                    for (ary = [], iz = i + num; i < iz; ) {
+                        c = buf[++i]; // lead byte
+                        ary.push(c < 0x80 ? c : // ASCII(0x00 ~ 0x7f)
+                                 c < 0xe0 ? ((c & 0x1f) <<  6 | (buf[++i] & 0x3f)) :
+                                            ((c & 0x0f) << 12 | (buf[++i] & 0x3f) << 6
+                                                              | (buf[++i] & 0x3f)));
+                    }
+                    that._idx = i;
+                    return ary.length < 10240 ? _toString.apply(null, ary)
+                                              : byteArrayToByteString(ary);
+        // 0xdf: map32, 0xde: map16, 0x80: map
+        case 0xdf:  if (buf.length <= (that._idx + 4)) { return; }
+                    num +=  buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16);
+        case 0xde:  if (buf.length <= (that._idx + 2)) { return; }
+                    num += (buf[++that._idx] << 8)       +  buf[++that._idx];
+        case 0x80:  if (num <= 0) { return {}; } 
+                    push_stack(that, constant.MAP_KEY, num, {});
+                    return stream_decode_token(that);
+        // 0xdd: array32, 0xdc: array16, 0x90: array
+        case 0xdd:  if (buf.length <= (that._idx + 4)) { return; }
+                    num +=  buf[++that._idx] * 0x1000000 + (buf[++that._idx] << 16);
+        case 0xdc:  if (buf.length <= (that._idx + 2)) { return; }
+                    num += (buf[++that._idx] << 8)       +  buf[++that._idx];
+        case 0x90:  if (num <= 0) { return []; } 
+                    push_stack(that, constant.ARRAY_VALUE, num, []);
+                    return stream_decode_token(that);
+        }
+        return;
+    }
+    _stream_decoder.prototype.unpack = function (data) { // @param BinaryString/ByteArray:
+                                   // @return Mix/undefined:
+                                   //       undefined is error return
+        //  [1][String to mix]    msgpack.unpack("...") -> {}
+        //  [2][ByteArray to mix] msgpack.unpack([...]) -> {}
+        var that = this;
+        //console.log("buffer:" + JSON.stringify(data));
+        if (data != null) {
+            var readlen = that._idx + 1;
+            if (that._buf.length > readlen) {
+                // create new bytearray which is [prev remain] + [new data]
+                var tmp = that._buf.subarray(readlen);
+                that._buf = new Uint8Array(that._buf.length - readlen + data.length);
+                that._buf.set(tmp);
+                that._buf.set(typeof data === "string" ? toByteArray(data) : data, tmp.length);
+            }
+            else {
+                that._buf = typeof data === "string" ? toByteArray(data) : data;
+            }
+            that._idx = -1;
+        }
+        return stream_decode(that); // mix or undefined or null (buff short)
+    }
+    return _stream_decoder;
+})();
 
 // inner - byteArray To ByteString
 function byteArrayToByteString(byteArray) { // @param ByteArray
