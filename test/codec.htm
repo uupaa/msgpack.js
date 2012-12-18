@@ -36,6 +36,16 @@ uu.ready(function(uu) {
         return uu.array.dump(ary, "0x", ", 0x");
     };
 
+    var args = window.location.search.substr(1).split('&');
+    for (v in args) {
+        var s = args[v].split('=');
+        if (s[0] == 'stream' && s[1] == '1') {
+            msgpack.unpack = function (data) {
+                return msgpack.stream_unpacker().unpack(data);
+            }
+        }
+    }
+
     uu.test({
         "FixNum, uint and int": "",
             "Number(0) -> [0x00] (Positive FixNum)": function() {
